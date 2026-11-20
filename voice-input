@@ -291,16 +291,23 @@ def run_service():
             self.stop_req.clear()
             self.worker_stop.clear()
             self.worker_flush.clear()
+            # 每个会话用新队列：旧流迟到的回调不会把残音喂进新会话
+            self.audio_q = queue.Queue()
+            q = self.audio_q
             self.segmenter = Segmenter(vad, self._on_segment)
-            threading.Thread(target=self._audio_worker, daemon=True).start()
+            threading.Thread(target=self._audio_worker,
+                             args=(self.segmenter, q), daemon=True).start()
             if TEST_WAV:
-                threading.Thread(target=self._feed_wav, daemon=True).start()
+                threading.Thread(target=self._feed_wav, args=(q,),
+                                 daemon=True).start()
             else:
+                def cb(indata, frames, t, status):
+                    q.put(indata[:, 0].copy())
                 try:
                     self.stream = sd.InputStream(
                         samplerate=SAMPLE_RATE, channels=1,
                         dtype='float32', blocksize=WIN,
-                        callback=self._mic_cb)
+                        callback=cb)
                     self.stream.start()
                 except Exception as e:
                     log(f'麦克风打开失败: {e}')
@@ -372,41 +379,48 @@ def run_service():
             self.aux_pending = None
 
         # ---- 音频回调与 worker（非主线程，禁止直接调 IBus） ----
-        def _mic_cb(self, indata, frames, t, status):
-            self.audio_q.put(indata[:, 0].copy())
-
-        def _feed_wav(self):
+        def _feed_wav(self, q):
             # VOICE_INPUT_TEST_WAV：按实时节奏喂文件，随后持续喂静音
             audio = read_wav_16k(TEST_WAV)
             silence = np.zeros(WIN, dtype=np.float32)
             i = 0
-            while not self.worker_stop.is_set():
+            while not self.worker_stop.is_set() and not self.worker_flush.is_set():
                 if i + WIN <= len(audio):
                     w = audio[i:i + WIN]
                     i += WIN
                 else:
                     w = silence
-                self.audio_q.put(w.copy())
+                q.put(w.copy())
                 time.sleep(WIN / SAMPLE_RATE)
 
-        def _audio_worker(self):
-            seg = self.segmenter
+        def _audio_worker(self, seg, q):
+            # 队列绑定会话：旧音频流的迟到回调喂不进本会话
             while not self.worker_stop.is_set():
                 try:
-                    w = self.audio_q.get(timeout=0.15)
+                    w = q.get(timeout=0.15)
                 except queue.Empty:
                     # 真麦模式队列会在关麦后一直空，flush/stop 都要在这里检查，
                     # 否则 worker 空转、_finish_now 永远排不上（实测踩坑）
                     if self.worker_stop.is_set() or self.worker_flush.is_set():
                         break
                     continue
+                if not seg.discard:
+                    seg.feed(w)
                 if self.worker_flush.is_set():
                     break
-                seg.feed(w)
                 if seg.idle_wins >= IDLE_STOP_WINS and seg.voiced == 0:
                     log('20s 无语音，自动停止')
                     GLib.idle_add(self._stop, True)
                     break
+            # 冲刷：识别耗时期间mic仍在进队列，先把积压窗口喂完再 flush，
+            # 否则按下停止前的尾音会被丢弃；discard（Esc/外部禁用）则只排空
+            while True:
+                try:
+                    w = q.get_nowait()
+                except queue.Empty:
+                    break
+                if not seg.discard:
+                    seg.feed(w)
             seg.flush()
             GLib.idle_add(self._finish_now)
 
