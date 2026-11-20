@@ -191,9 +191,11 @@ def run_service():
             app.engine_disabled(self)
 
         def do_focus_in(self):
+            log('engine focus_in')
             app.engine_focus_in(self)
 
         def do_focus_out(self):
+            log('engine focus_out')
             app.engine_focus_out(self)
 
         def do_process_key_event(self, keyval, keycode, state):
@@ -212,6 +214,7 @@ def run_service():
                 os._exit(3)
             self.state = 'idle'  # idle | listening | finishing
             self.prev_engine = 'rime'
+            self.restore = True   # 结束时是否回切（外部禁用则不回切）
             self.engine = None      # 当前已 enable 的引擎实例
             self.engine_has_focus = False
             self.aux_pending = None
@@ -223,6 +226,18 @@ def run_service():
             self.segmenter = None
 
         # ---- IBus 连接 ----
+        def _set_engine(self, name):
+            # 必须用 async 版本：sync 版会阻塞主循环，
+            # 导致 daemon 的 create_engine 请求超时（实测 ~15s 才 enable）
+            self.bus.set_global_engine_async(
+                name, -1, None, self._on_set_engine, None)
+
+        def _on_set_engine(self, bus, res, _):
+            try:
+                bus.set_global_engine_async_finish(res)
+            except Exception as e:
+                log(f'set_global_engine 失败: {e}')
+
         def _on_disconnected(self, bus):
             log('ibus-daemon 断开，退出等待 systemd 重启')
             os._exit(3)
@@ -253,12 +268,15 @@ def run_service():
 
         # ---- 状态机 ----
         def toggle(self):
+            # 信号回调必须返回 True，否则 GLib 触发一次就移除 handler，
+            # 第二次 SIGUSR1 走默认动作直接杀进程（实测踩坑）
             if self.state == 'idle':
                 self._start()
             elif self.state == 'listening':
                 self._stop(flush=True)
             else:
                 log('finishing 中，忽略切换信号')
+            return True
 
         def _start(self):
             try:
@@ -268,8 +286,9 @@ def run_service():
                 log(f'get_global_engine 失败: {e}')
                 name = None
             self.prev_engine = name if name and name != ENGINE_NAME else 'rime'
+            self.restore = True
             log(f'start: prev_engine={self.prev_engine}')
-            self.bus.set_global_engine(ENGINE_NAME)
+            self._set_engine(ENGINE_NAME)
             self.state = 'listening'
             self.stop_req.clear()
             self.worker_stop.clear()
@@ -304,6 +323,7 @@ def run_service():
 
         def _abort_session(self, restore):
             # 取消/外部禁用：丢弃在途语音，停止一切
+            self.restore = restore
             if self.segmenter:
                 self.segmenter.discard = True
             self._close_mic()
@@ -325,12 +345,9 @@ def run_service():
             self.state = 'idle'
             self.worker_stop.set()
             self._hide_aux()
-            if self.prev_engine:
+            if self.restore and self.prev_engine:
                 log(f'restore engine -> {self.prev_engine}')
-                try:
-                    self.bus.set_global_engine(self.prev_engine)
-                except Exception as e:
-                    log(f'set_global_engine 恢复失败: {e}')
+                self._set_engine(self.prev_engine)
 
         def on_escape(self):
             if self.state == 'listening':
@@ -422,7 +439,7 @@ def run_service():
         name='org.local.VoiceInput',
         description='Local offline Chinese voice input',
         version='1.0', license='MIT',
-        author='local', homepage='', command_line='', text_domain='')
+        author='local', homepage='', command_line='', textdomain='')
     desc = IBus.EngineDesc(
         name=ENGINE_NAME, longname='语音输入',
         description='本地离线中文语音输入（SenseVoice）',
@@ -435,7 +452,11 @@ def run_service():
                        GObject.type_from_name('VoiceInputEngine'))
     app.bus.register_component(component)
 
-    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, app.toggle)
+    try:
+        from gi.repository import GLibUnix
+        GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, app.toggle)
+    except Exception:
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, app.toggle)
     log('ready (SIGUSR1 toggle)')
     GLib.MainLoop().run()
     return 0
