@@ -191,11 +191,9 @@ def run_service():
             app.engine_disabled(self)
 
         def do_focus_in(self):
-            log('engine focus_in')
             app.engine_focus_in(self)
 
         def do_focus_out(self):
-            log('engine focus_out')
             app.engine_focus_out(self)
 
         def do_process_key_event(self, keyval, keycode, state):
@@ -397,7 +395,9 @@ def run_service():
                 try:
                     w = self.audio_q.get(timeout=0.15)
                 except queue.Empty:
-                    if self.worker_stop.is_set():
+                    # 真麦模式队列会在关麦后一直空，flush/stop 都要在这里检查，
+                    # 否则 worker 空转、_finish_now 永远排不上（实测踩坑）
+                    if self.worker_stop.is_set() or self.worker_flush.is_set():
                         break
                     continue
                 if self.worker_flush.is_set():
