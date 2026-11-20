@@ -1,0 +1,447 @@
+#!/usr/bin/env python3
+# voice-input: 本地离线中文语音输入（IBus 引擎 + SenseVoice + Silero VAD）
+# Super+Z 开始听写，再按一次结束并回填文本，Esc 取消。
+import os
+import sys
+
+# 自动切到同目录 venv 解释器（systemd 与命令行都走这里）
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_VENV_PY = os.path.join(_HERE, 'venv', 'bin', 'python')
+# venv/bin/python 是指向系统 python 的软链，比较 realpath 会误判，须比路径本身
+if os.path.exists(_VENV_PY) and sys.executable != _VENV_PY:
+    os.execv(_VENV_PY, [_VENV_PY] + sys.argv)
+
+import queue
+import re
+import signal
+import string
+import threading
+import time
+
+import numpy as np
+
+MODELS = os.environ.get('VOICE_INPUT_MODELS',
+                        os.path.expanduser('~/src/sub-live-v2/models'))
+LANG = os.environ.get('VOICE_INPUT_LANG', 'zh')
+TEST_WAV = os.environ.get('VOICE_INPUT_TEST_WAV', '')
+DEBUG = os.environ.get('VOICE_INPUT_DEBUG', '') == '1'
+
+ENGINE_NAME = 'voice-input'
+AUX_LISTENING = '正在听… Super+Z 结束 / Esc 取消'
+AUX_FINISHING = '识别中…'
+
+SAMPLE_RATE = 16000
+WIN = 512  # Silero VAD 窗口（32ms @16k）
+LEAD_WINS = int(0.2 * SAMPLE_RATE / WIN)    # 句首预录 0.2s
+PAUSE_WINS = int(0.6 * SAMPLE_RATE / WIN)   # 0.6s 静音切句
+MIN_WINS = int(0.3 * SAMPLE_RATE / WIN)     # 最短语音 0.3s
+MAX_WINS = int(20 * SAMPLE_RATE / WIN)      # 单句上限 20s
+IDLE_STOP_WINS = int(20 * SAMPLE_RATE / WIN)  # 20s 一直无语音自动停
+
+_PAD = np.zeros(8000, dtype=np.float32)  # 段前后各补 0.5s 静音
+
+_PUNCT_ONLY = set(string.punctuation + '，。！？、；：‘’“”…—·《》【】〈〉％＃＆＊＠～')
+
+
+def log(msg):
+    print(f'[voice-input] {msg}', file=sys.stderr, flush=True)
+
+
+def load_vad():
+    import sherpa_onnx
+    cfg = sherpa_onnx.VadModelConfig()
+    cfg.silero_vad.model = os.path.join(MODELS, 'silero-vad', 'silero_vad.onnx')
+    cfg.silero_vad.threshold = 0.5  # 近场麦克风，无需 AGC
+    cfg.sample_rate = SAMPLE_RATE
+    vad = sherpa_onnx.VadModel.create(cfg)
+    return vad
+
+
+def load_recognizer():
+    import sherpa_onnx
+    m = os.path.join(MODELS, 'sensevoice')
+    lang = LANG if LANG in ('zh', 'en', 'ja', 'ko', 'yue') else 'auto'
+    return sherpa_onnx.OfflineRecognizer.from_sense_voice(
+        model=os.path.join(m, 'model.int8.onnx'),
+        tokens=os.path.join(m, 'tokens.txt'),
+        num_threads=4, language=lang, use_itn=True)
+
+
+def recognize(recognizer, audio16):
+    s = recognizer.create_stream()
+    # 前后补 0.5s 静音，避免贪心解码在紧贴语音的切片上丢字
+    s.accept_waveform(SAMPLE_RATE, np.concatenate([_PAD, audio16, _PAD]))
+    recognizer.decode_stream(s)
+    return s.result.text.strip()
+
+
+def clean_text(text):
+    text = re.sub(r'\s+', '', text) if re.search(r'[一-鿿]', text) else text.strip()
+    if not text:
+        return ''
+    # 丢弃纯标点结果
+    if all(c in _PUNCT_ONLY for c in text):
+        return ''
+    return text
+
+
+class Segmenter:
+    # VAD 分段状态机：窗口流入 -> 检出语音段 -> 交回调
+    def __init__(self, vad, on_segment):
+        self.vad = vad
+        self.on_segment = on_segment
+        self.reset()
+        self.idle_wins = 0  # 会话开始以来连续无语音窗口数
+
+    def reset(self):
+        self.lead = []
+        self.chunks = []
+        self.voiced = 0
+        self.silence = 0
+        self.discard = False
+
+    def feed(self, window):
+        is_speech = bool(self.vad.is_speech(window))
+        if is_speech:
+            self.chunks.append(window)
+            self.voiced += 1
+            self.silence = 0
+            self.idle_wins = 0
+        else:
+            if self.voiced > 0:
+                self.chunks.append(window)
+                self.silence += 1
+            else:
+                self.lead.append(window)
+                if len(self.lead) > LEAD_WINS:
+                    self.lead.pop(0)
+                self.idle_wins += 1
+
+        done = (self.voiced >= MIN_WINS and self.silence >= PAUSE_WINS) \
+            or len(self.chunks) >= MAX_WINS
+        if done:
+            self._emit()
+
+    def flush(self):
+        # 停止时冲刷在途的半句
+        if self.chunks:
+            self._emit()
+
+    def _emit(self):
+        if not self.discard:
+            audio16 = np.concatenate(self.lead + self.chunks)
+            if self.voiced >= MIN_WINS:
+                self.on_segment(audio16)
+        self.reset()
+
+
+# ---------------- selftest：无 IBus，跑完整 VAD+ASR 分段 ----------------
+
+def read_wav_16k(path):
+    import wave
+    w = wave.open(path)
+    if w.getframerate() != SAMPLE_RATE or w.getnchannels() != 1 or w.getsampwidth() != 2:
+        raise SystemExit(f'{path}: 只支持 16kHz 单声道 s16 wav'
+                         f'（实际 {w.getframerate()}Hz/{w.getnchannels()}ch/{w.getsampwidth()}B）')
+    frames = w.readframes(w.getnframes())
+    return np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+
+
+def selftest(path):
+    vad = load_vad()
+    rec = load_recognizer()
+    segments = []
+
+    def on_seg(audio16):
+        t0 = time.time()
+        text = clean_text(recognize(rec, audio16))
+        dt = time.time() - t0
+        segments.append((len(audio16) / SAMPLE_RATE, text, dt))
+
+    seg = Segmenter(vad, on_seg)
+    audio = read_wav_16k(path)
+    for i in range(0, len(audio) - WIN + 1, WIN):
+        seg.feed(audio[i:i + WIN])
+    seg.flush()
+    for dur, text, dt in segments:
+        print(f'[{dur:5.2f}s | asr {dt:.2f}s] {text}')
+    print(f'{len(segments)} segment(s)')
+    return 0
+
+
+# ---------------- IBus 服务 ----------------
+
+def run_service():
+    import gi
+    gi.require_version('IBus', '1.0')
+    from gi.repository import IBus, GLib, GObject
+    import sounddevice as sd
+
+    vad = load_vad()
+    recognizer = load_recognizer()
+    log('models loaded')
+
+    class VoiceInputEngine(IBus.Engine):
+        __gtype_name__ = 'VoiceInputEngine'
+
+        def do_enable(self):
+            app.engine_enabled(self)
+
+        def do_disable(self):
+            app.engine_disabled(self)
+
+        def do_focus_in(self):
+            app.engine_focus_in(self)
+
+        def do_focus_out(self):
+            app.engine_focus_out(self)
+
+        def do_process_key_event(self, keyval, keycode, state):
+            pressed = not (state & IBus.ModifierType.RELEASE_MASK)
+            if pressed and keyval == IBus.KEY_Escape:
+                if app.on_escape():
+                    return True
+            return False
+
+    class App:
+        def __init__(self):
+            self.bus = IBus.Bus()
+            self.bus.connect('disconnected', self._on_disconnected)
+            if not self.bus.is_connected():
+                log('ibus-daemon 未连接，退出等待 systemd 重启')
+                os._exit(3)
+            self.state = 'idle'  # idle | listening | finishing
+            self.prev_engine = 'rime'
+            self.engine = None      # 当前已 enable 的引擎实例
+            self.engine_has_focus = False
+            self.aux_pending = None
+            self.stream = None
+            self.audio_q = queue.Queue()
+            self.worker_stop = threading.Event()
+            self.worker_flush = threading.Event()
+            self.stop_req = threading.Event()
+            self.segmenter = None
+
+        # ---- IBus 连接 ----
+        def _on_disconnected(self, bus):
+            log('ibus-daemon 断开，退出等待 systemd 重启')
+            os._exit(3)
+
+        # ---- 引擎实例生命周期（主线程） ----
+        def engine_enabled(self, eng):
+            self.engine = eng
+            self.engine_has_focus = True
+            if self.aux_pending is not None:
+                self._show_aux(self.aux_pending)
+                self.aux_pending = None
+            log('engine enabled')
+
+        def engine_disabled(self, eng):
+            if self.engine is eng:
+                self.engine = None
+            self.engine_has_focus = False
+            log('engine disabled')
+            # 外部切走（如 Super+Space）：丢音、丢状态、不回切
+            if self.state != 'idle':
+                self._abort_session(restore=False)
+
+        def engine_focus_in(self, eng):
+            self.engine_has_focus = True
+
+        def engine_focus_out(self, eng):
+            self.engine_has_focus = False
+
+        # ---- 状态机 ----
+        def toggle(self):
+            if self.state == 'idle':
+                self._start()
+            elif self.state == 'listening':
+                self._stop(flush=True)
+            else:
+                log('finishing 中，忽略切换信号')
+
+        def _start(self):
+            try:
+                cur = self.bus.get_global_engine()
+                name = cur.get_name() if cur else None
+            except Exception as e:
+                log(f'get_global_engine 失败: {e}')
+                name = None
+            self.prev_engine = name if name and name != ENGINE_NAME else 'rime'
+            log(f'start: prev_engine={self.prev_engine}')
+            self.bus.set_global_engine(ENGINE_NAME)
+            self.state = 'listening'
+            self.stop_req.clear()
+            self.worker_stop.clear()
+            self.worker_flush.clear()
+            self.segmenter = Segmenter(vad, self._on_segment)
+            threading.Thread(target=self._audio_worker, daemon=True).start()
+            if TEST_WAV:
+                threading.Thread(target=self._feed_wav, daemon=True).start()
+            else:
+                try:
+                    self.stream = sd.InputStream(
+                        samplerate=SAMPLE_RATE, channels=1,
+                        dtype='float32', blocksize=WIN,
+                        callback=self._mic_cb)
+                    self.stream.start()
+                except Exception as e:
+                    log(f'麦克风打开失败: {e}')
+                    self._abort_session(restore=True)
+                    return
+            self._aux(AUX_LISTENING)
+
+        def _stop(self, flush):
+            log(f'stop: flush={flush}')
+            if self.state == 'listening':
+                self.state = 'finishing'
+            self._close_mic()
+            if flush:
+                self._aux(AUX_FINISHING)
+                self.worker_flush.set()
+            else:
+                self._finish_now()
+
+        def _abort_session(self, restore):
+            # 取消/外部禁用：丢弃在途语音，停止一切
+            if self.segmenter:
+                self.segmenter.discard = True
+            self._close_mic()
+            if self.state != 'idle':
+                self.state = 'finishing'
+                self.worker_flush.set()  # 让 worker 退出后回调 _finish_now
+
+        def _close_mic(self):
+            if self.stream is not None:
+                try:
+                    self.stream.stop()
+                    self.stream.close()
+                except Exception:
+                    pass
+                self.stream = None
+
+        def _finish_now(self):
+            # 所有提交都已通过 idle_add 排队完成，这里最后恢复
+            self.state = 'idle'
+            self.worker_stop.set()
+            self._hide_aux()
+            if self.prev_engine:
+                log(f'restore engine -> {self.prev_engine}')
+                try:
+                    self.bus.set_global_engine(self.prev_engine)
+                except Exception as e:
+                    log(f'set_global_engine 恢复失败: {e}')
+
+        def on_escape(self):
+            if self.state == 'listening':
+                log('Esc 取消')
+                self._abort_session(restore=True)
+                return True
+            return False
+
+        # ---- aux 文本（主线程） ----
+        def _aux(self, s):
+            if self.engine is not None:
+                self._show_aux(s)
+            else:
+                self.aux_pending = s
+
+        def _show_aux(self, s):
+            if self.engine is not None:
+                self.engine.update_auxiliary_text(
+                    IBus.Text.new_from_string(s), True)
+
+        def _hide_aux(self):
+            if self.engine is not None:
+                self.engine.hide_auxiliary_text()
+            self.aux_pending = None
+
+        # ---- 音频回调与 worker（非主线程，禁止直接调 IBus） ----
+        def _mic_cb(self, indata, frames, t, status):
+            self.audio_q.put(indata[:, 0].copy())
+
+        def _feed_wav(self):
+            # VOICE_INPUT_TEST_WAV：按实时节奏喂文件，随后持续喂静音
+            audio = read_wav_16k(TEST_WAV)
+            silence = np.zeros(WIN, dtype=np.float32)
+            i = 0
+            while not self.worker_stop.is_set():
+                if i + WIN <= len(audio):
+                    w = audio[i:i + WIN]
+                    i += WIN
+                else:
+                    w = silence
+                self.audio_q.put(w.copy())
+                time.sleep(WIN / SAMPLE_RATE)
+
+        def _audio_worker(self):
+            seg = self.segmenter
+            while not self.worker_stop.is_set():
+                try:
+                    w = self.audio_q.get(timeout=0.15)
+                except queue.Empty:
+                    if self.worker_stop.is_set():
+                        break
+                    continue
+                if self.worker_flush.is_set():
+                    break
+                seg.feed(w)
+                if seg.idle_wins >= IDLE_STOP_WINS and seg.voiced == 0:
+                    log('20s 无语音，自动停止')
+                    GLib.idle_add(self._stop, True)
+                    break
+            seg.flush()
+            GLib.idle_add(self._finish_now)
+
+        def _on_segment(self, audio16):
+            dur = len(audio16) / SAMPLE_RATE
+            t0 = time.time()
+            try:
+                text = clean_text(recognize(recognizer, audio16))
+            except Exception as e:
+                log(f'识别错误: {e}')
+                return
+            log(f'segment {dur:.2f}s -> asr {time.time()-t0:.2f}s')
+            if DEBUG and text:
+                log(f'[debug] text: {text}')
+            if text:
+                GLib.idle_add(self._commit, text)
+
+        def _commit(self, text):
+            # 主线程：交给当前已聚焦的引擎实例上屏
+            eng = self.engine
+            if eng is not None and self.engine_has_focus:
+                eng.commit_text(IBus.Text.new_from_string(text))
+            else:
+                log('引擎未聚焦，丢弃提交')
+            return False
+
+    app = App()
+
+    component = IBus.Component(
+        name='org.local.VoiceInput',
+        description='Local offline Chinese voice input',
+        version='1.0', license='MIT',
+        author='local', homepage='', command_line='', text_domain='')
+    desc = IBus.EngineDesc(
+        name=ENGINE_NAME, longname='语音输入',
+        description='本地离线中文语音输入（SenseVoice）',
+        language='zh', license='MIT', author='local',
+        icon='audio-input-microphone', layout='default')
+    component.add_engine(desc)
+
+    factory = IBus.Factory.new(app.bus.get_connection())
+    factory.add_engine(ENGINE_NAME,
+                       GObject.type_from_name('VoiceInputEngine'))
+    app.bus.register_component(component)
+
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, app.toggle)
+    log('ready (SIGUSR1 toggle)')
+    GLib.MainLoop().run()
+    return 0
+
+
+if __name__ == '__main__':
+    if len(sys.argv) >= 3 and sys.argv[1] == '--selftest':
+        sys.exit(selftest(sys.argv[2]))
+    sys.exit(run_service())
