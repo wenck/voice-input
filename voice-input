@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-# voice-input: 本地离线中文语音输入（IBus 引擎 + SenseVoice + Silero VAD）
-# Super+Z 开始听写，再按一次结束并回填文本，Esc 取消。
+# voice-input: 本地离线中文语音输入（SenseVoice + Silero VAD）
+# Linux 走 IBus 引擎 + Super+Z；macOS 走 Quartz 事件监听 + Cmd+Z。
+# 快捷键开始听写，再按一次结束并回填文本，Esc 取消。
 import os
 import sys
 
@@ -20,14 +21,24 @@ import time
 
 import numpy as np
 
+IS_DARWIN = sys.platform == 'darwin'
+
 MODELS = os.environ.get('VOICE_INPUT_MODELS',
                         os.path.expanduser('~/src/sub-live-v2/models'))
+_SV_DEFAULT = os.path.expanduser(
+    '~/.cache/asr_models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17'
+) if IS_DARWIN else os.path.join(MODELS, 'sensevoice')
+_VAD_DEFAULT = os.path.expanduser('~/.cache/asr_models/silero_vad.onnx') \
+    if IS_DARWIN else os.path.join(MODELS, 'silero-vad', 'silero_vad.onnx')
+SENSEVOICE = os.environ.get('VOICE_INPUT_SENSEVOICE', _SV_DEFAULT)
+VAD_MODEL = os.environ.get('VOICE_INPUT_VAD', _VAD_DEFAULT)
 LANG = os.environ.get('VOICE_INPUT_LANG', 'zh')
 TEST_WAV = os.environ.get('VOICE_INPUT_TEST_WAV', '')
 DEBUG = os.environ.get('VOICE_INPUT_DEBUG', '') == '1'
 
 ENGINE_NAME = 'voice-input'
-AUX_LISTENING = '正在听… Super+Z 结束 / Esc 取消'
+_HOTKEY = 'Cmd+Z' if IS_DARWIN else 'Super+Z'
+AUX_LISTENING = f'正在听… {_HOTKEY} 结束 / Esc 取消'
 AUX_FINISHING = '识别中…'
 
 SAMPLE_RATE = 16000
@@ -50,7 +61,7 @@ def log(msg):
 def load_vad():
     import sherpa_onnx
     cfg = sherpa_onnx.VadModelConfig()
-    cfg.silero_vad.model = os.path.join(MODELS, 'silero-vad', 'silero_vad.onnx')
+    cfg.silero_vad.model = VAD_MODEL
     cfg.silero_vad.threshold = 0.5  # 近场麦克风，无需 AGC
     cfg.sample_rate = SAMPLE_RATE
     vad = sherpa_onnx.VadModel.create(cfg)
@@ -59,11 +70,10 @@ def load_vad():
 
 def load_recognizer():
     import sherpa_onnx
-    m = os.path.join(MODELS, 'sensevoice')
     lang = LANG if LANG in ('zh', 'en', 'ja', 'ko', 'yue') else 'auto'
     return sherpa_onnx.OfflineRecognizer.from_sense_voice(
-        model=os.path.join(m, 'model.int8.onnx'),
-        tokens=os.path.join(m, 'tokens.txt'),
+        model=os.path.join(SENSEVOICE, 'model.int8.onnx'),
+        tokens=os.path.join(SENSEVOICE, 'tokens.txt'),
         num_threads=4, language=lang, use_itn=True)
 
 
@@ -169,9 +179,9 @@ def selftest(path):
     return 0
 
 
-# ---------------- IBus 服务 ----------------
+# ---------------- IBus 服务（Linux） ----------------
 
-def run_service():
+def run_service_linux():
     import gi
     gi.require_version('IBus', '1.0')
     from gi.repository import IBus, GLib, GObject
@@ -474,6 +484,452 @@ def run_service():
     log('ready (SIGUSR1 toggle)')
     GLib.MainLoop().run()
     return 0
+
+
+# ---------------- macOS 服务（Quartz 事件监听 + 合成键盘事件回填） ----------------
+
+def run_service_macos():
+    import Quartz
+    import sounddevice as sd
+    from Cocoa import (NSApplication, NSStatusBar, NSMenu, NSMenuItem,
+                       NSSound, NSObject, NSTimer, NSURL, NSWorkspace,
+                       NSRunningApplication,
+                       NSVariableStatusItemLength,
+                       NSApplicationActivationPolicyAccessory)
+    from PyObjCTools import AppHelper
+    try:
+        from ApplicationServices import (
+            AXUIElementCreateSystemWide, AXUIElementCopyAttributeValue,
+            AXUIElementGetPid, AXIsProcessTrustedWithOptions,
+            kAXTrustedCheckOptionPrompt)
+    except ImportError:
+        AXUIElementCreateSystemWide = None
+        AXIsProcessTrustedWithOptions = None
+
+    vad = load_vad()
+    recognizer = load_recognizer()
+    log('models loaded')
+
+    KEY_Z = 6        # kVK_ANSI_Z
+    KEY_ESC = 53     # kVK_Escape
+    OTHER_MODS = (Quartz.kCGEventFlagMaskShift |
+                  Quartz.kCGEventFlagMaskControl |
+                  Quartz.kCGEventFlagMaskAlternate)
+
+    class App:
+        def __init__(self):
+            self.state = 'idle'  # idle | listening | finishing
+            self.stream = None
+            self.audio_q = queue.Queue()
+            self.worker_stop = threading.Event()
+            self.worker_flush = threading.Event()
+            self.segmenter = None
+            self.status_item = None
+            self.hotkey_ready = False
+            self.snd_start = NSSound.alloc().initWithContentsOfFile_byReference_(
+                '/System/Library/Sounds/Tink.aiff', True)
+            self.snd_stop = NSSound.alloc().initWithContentsOfFile_byReference_(
+                '/System/Library/Sounds/Pop.aiff', True)
+
+        def _play(self, snd):
+            # NSSound.play() 在远程桌面会话里会卡死主线程，放后台线程
+            threading.Thread(target=snd.play, daemon=True).start()
+
+        # ---- 状态栏（主线程） ----
+        def _status(self, s):
+            if self.status_item is not None:
+                self.status_item.button().setTitle_(s)
+
+        # ---- 状态机（全部经 callAfter 落到主线程） ----
+        def toggle(self):
+            if self.state == 'idle':
+                self._start()
+            elif self.state == 'listening':
+                self._stop(flush=True)
+            else:
+                log('finishing 中，忽略切换信号')
+
+        def _start(self):
+            self.state = 'listening'
+            self.worker_stop.clear()
+            self.worker_flush.clear()
+            # 每个会话用新队列：旧流迟到的回调不会把残音喂进新会话
+            self.audio_q = queue.Queue()
+            q = self.audio_q
+            self.segmenter = Segmenter(vad, self._on_segment)
+            threading.Thread(target=self._audio_worker,
+                             args=(self.segmenter, q), daemon=True).start()
+            if TEST_WAV:
+                threading.Thread(target=self._feed_wav, args=(q,),
+                                 daemon=True).start()
+            else:
+                def cb(indata, frames, t, status):
+                    q.put(indata[:, 0].copy())
+                result = []
+
+                def open_mic():
+                    # 无麦克风权限时 InputStream 可能永久阻塞而不是报错
+                    # （实测远程桌面会话卡死主线程），限 3s 超时
+                    try:
+                        st = sd.InputStream(
+                            samplerate=SAMPLE_RATE, channels=1,
+                            dtype='float32', blocksize=WIN,
+                            callback=cb)
+                        st.start()
+                        with lock:
+                            if timed_out:
+                                # 超时后才打开成功（如授权弹窗刚被点允许）：
+                                # 本会话已放弃，立即关闭，避免麦克风被孤儿流占用
+                                st.stop()
+                                st.close()
+                                return
+                            result.append(st)
+                    except Exception as e:
+                        result.append(e)
+
+                lock = threading.Lock()
+                timed_out = False
+                t = threading.Thread(target=open_mic, daemon=True)
+                t.start()
+                t.join(3)
+                with lock:
+                    timed_out = not result
+                if not result or isinstance(result[0], Exception):
+                    log(f'麦克风打开失败: {"超时" if not result else result[0]}')
+                    self._abort_session()
+                    return
+                self.stream = result[0]
+            log('start listening')
+            self._status('听…')
+            self._play(self.snd_start)
+
+        def _stop(self, flush):
+            log(f'stop: flush={flush}')
+            if self.state == 'listening':
+                self.state = 'finishing'
+                self._status('识别…')
+            self._close_mic()
+            if flush:
+                self.worker_flush.set()
+            else:
+                self._finish_now()
+
+        def _abort_session(self):
+            # Esc 取消：丢弃在途语音，停止一切
+            if self.segmenter:
+                self.segmenter.discard = True
+            self._close_mic()
+            if self.state != 'idle':
+                self.state = 'finishing'
+                self.worker_flush.set()  # 让 worker 退出后回调 _finish_now
+
+        def _close_mic(self):
+            if self.stream is not None:
+                try:
+                    self.stream.stop()
+                    self.stream.close()
+                except Exception:
+                    pass
+                self.stream = None
+
+        def _finish_now(self):
+            # 所有提交都已通过 callAfter 排队完成，这里最后收尾
+            self.state = 'idle'
+            self.worker_stop.set()
+            self._status('语音' if self.hotkey_ready else '需授权')
+            self._play(self.snd_stop)
+
+        def on_escape(self):
+            if self.state == 'listening':
+                log('Esc 取消')
+                self._abort_session()
+
+        # ---- 音频回调与 worker（非主线程，经 callAfter 回主线程） ----
+        def _feed_wav(self, q):
+            # VOICE_INPUT_TEST_WAV：按实时节奏喂文件，随后持续喂静音
+            audio = read_wav_16k(TEST_WAV)
+            silence = np.zeros(WIN, dtype=np.float32)
+            i = 0
+            while not self.worker_stop.is_set() and not self.worker_flush.is_set():
+                if i + WIN <= len(audio):
+                    w = audio[i:i + WIN]
+                    i += WIN
+                else:
+                    w = silence
+                q.put(w.copy())
+                time.sleep(WIN / SAMPLE_RATE)
+
+        def _audio_worker(self, seg, q):
+            # 队列绑定会话：旧音频流的迟到回调喂不进本会话
+            while not self.worker_stop.is_set():
+                try:
+                    w = q.get(timeout=0.15)
+                except queue.Empty:
+                    if self.worker_stop.is_set() or self.worker_flush.is_set():
+                        break
+                    continue
+                if not seg.discard:
+                    seg.feed(w)
+                if self.worker_flush.is_set():
+                    break
+                if seg.idle_wins >= IDLE_STOP_WINS and seg.voiced == 0:
+                    log('20s 无语音，自动停止')
+                    AppHelper.callAfter(self._stop, True)
+                    break
+            # 冲刷：识别耗时期间mic仍在进队列，先把积压窗口喂完再 flush；
+            # discard（Esc）则只排空
+            while True:
+                try:
+                    w = q.get_nowait()
+                except queue.Empty:
+                    break
+                if not seg.discard:
+                    seg.feed(w)
+            seg.flush()
+            AppHelper.callAfter(self._finish_now)
+
+        def _on_segment(self, audio16):
+            dur = len(audio16) / SAMPLE_RATE
+            t0 = time.time()
+            try:
+                text = clean_text(recognize(recognizer, audio16))
+            except Exception as e:
+                log(f'识别错误: {e}')
+                return
+            log(f'segment {dur:.2f}s -> asr {time.time()-t0:.2f}s')
+            if DEBUG and text:
+                log(f'[debug] text: {text}')
+            if text:
+                # focused_pid 的 AX/NSWorkspace 查询偶发阻塞（实测主线程
+                # 被卡死后整个 runloop 停摆），故放到独立线程查询并限时，
+                # 主线程只负责投递键盘事件
+                found = []
+                t = threading.Thread(
+                    target=lambda: found.append(focused_pid()),
+                    daemon=True)
+                t.start()
+                t.join(2)
+                if not found:
+                    log('焦点查询超时，丢弃提交')
+                elif found[0] is None:
+                    log('无焦点应用，丢弃提交')
+                else:
+                    AppHelper.callAfter(self._commit, text, found[0])
+
+        def _commit(self, text, pid):
+            # 主线程：合成键盘事件注入到当前焦点应用
+            log(f'commit -> pid={pid}')
+            inject_text(text, pid)
+
+    def _valid_pid(pid):
+        # 剔除自身与 loginwindow：远程桌面会话里 AX/frontmost 都会错报它
+        if not pid or int(pid) == os.getpid():
+            return False
+        ra = NSRunningApplication.runningApplicationWithProcessIdentifier_(
+            int(pid))
+        # universalAccessAuthWarn（授权弹窗）在 LaunchServices 里查无记录，
+        # 解析不出应用记录的 pid 一律剔除
+        if ra is None:
+            return False
+        # loginwindow 与授权弹窗都不是合法的提交目标；注意不能用
+        # activationPolicy 过滤——远程桌面会话里普通应用也会误报为 Prohibited
+        blocked = {'com.apple.loginwindow', 'loginwindow',
+                   'com.apple.accessibility.universalAccessAuthWarn',
+                   'universalAccessAuthWarn'}
+        if blocked & {ra.bundleIdentifier(), ra.localizedName()}:
+            return False
+        return True
+
+    def focused_pid():
+        # AX / NSWorkspace 在正常 Mac 上是权威答案。远程桌面会话里它们会
+        # 错报 loginwindow 或其它常驻应用，故取屏幕窗口层级列表
+        # （front-to-back，第一个普通窗口的属主）做交叉验证：AX 答案与
+        # 最顶层普通窗口一致才采信，否则信物理层级顺序
+        ax_pid = None
+        if AXUIElementCreateSystemWide is not None:
+            syswide = AXUIElementCreateSystemWide()
+            err, ref = AXUIElementCopyAttributeValue(
+                syswide, 'AXFocusedApplication', None)
+            if err == 0 and ref is not None:
+                err, pid = AXUIElementGetPid(ref, None)
+                if err == 0 and _valid_pid(pid):
+                    ax_pid = int(pid)
+        wl_pid = None
+        wl = Quartz.CGWindowListCopyWindowInfo(
+            Quartz.kCGWindowListOptionOnScreenOnly |
+            Quartz.kCGWindowListExcludeDesktopElements,
+            Quartz.kCGNullWindowID)
+        for w in wl:
+            if (w.get('kCGWindowLayer', -1) == 0
+                    and w.get('kCGWindowOwnerName') != 'WindowManager'
+                    and _valid_pid(w.get('kCGWindowOwnerPID'))):
+                wl_pid = int(w['kCGWindowOwnerPID'])
+                break
+        front_pid = None
+        front = NSWorkspace.sharedWorkspace().frontmostApplication()
+        if front is not None and _valid_pid(front.processIdentifier()):
+            front_pid = int(front.processIdentifier())
+        if DEBUG:
+            log(f'[debug] focus ax={ax_pid} wl={wl_pid} front={front_pid}')
+        if ax_pid is not None and (wl_pid is None or wl_pid == ax_pid):
+            return ax_pid
+        if wl_pid is not None:
+            return wl_pid
+        if front_pid is not None:
+            return front_pid
+        return ax_pid
+
+    def inject_text(text, pid):
+        # CGEventKeyboardSetUnicodeString 单次上限 20 个 UTF-16 码元
+        buf, units = '', 0
+        for ch in text:
+            u = len(ch.encode('utf-16-le')) // 2
+            if units + u > 20:
+                _post_text(buf, pid)
+                buf, units = '', 0
+            buf += ch
+            units += u
+        if buf:
+            _post_text(buf, pid)
+
+    def _post_text(s, pid):
+        # 注意：实测 kCGHIDEventTap 投递的键盘事件能过事件监听但到不了
+        # 焦点应用，须按 pid 直接投递
+        units = len(s.encode('utf-16-le')) // 2
+        for down in (True, False):
+            ev = Quartz.CGEventCreateKeyboardEvent(None, 0, down)
+            Quartz.CGEventKeyboardSetUnicodeString(ev, units, s)
+            Quartz.CGEventSetFlags(ev, 0)
+            Quartz.CGEventPostToPid(pid, ev)
+
+    app = App()
+
+    # ---- Cmd+Z / Esc 事件监听 ----
+    tap_holder = {}
+
+    def tap_cb(proxy, event_type, event, refcon):
+        if event_type in (Quartz.kCGEventTapDisabledByTimeout,
+                          Quartz.kCGEventTapDisabledByUserInput):
+            tap = tap_holder.get('tap')
+            if tap is not None:
+                Quartz.CGEventTapEnable(tap, True)
+            return event
+        keycode = Quartz.CGEventGetIntegerValueField(
+            event, Quartz.kCGKeyboardEventKeycode)
+        flags = Quartz.CGEventGetFlags(event)
+        cmd = bool(flags & Quartz.kCGEventFlagMaskCommand)
+        plain_cmd = cmd and not (flags & OTHER_MODS)
+        if event_type == Quartz.kCGEventKeyDown:
+            if keycode == KEY_Z and plain_cmd:
+                if Quartz.CGEventGetIntegerValueField(
+                        event, Quartz.kCGKeyboardEventAutorepeat):
+                    return None  # 吞掉自动重复
+                AppHelper.callAfter(app.toggle)
+                return None      # 吞掉，避免焦点应用触发撤销
+            if keycode == KEY_ESC and app.state == 'listening':
+                AppHelper.callAfter(app.on_escape)
+                return None      # 听写中吞掉 Esc，仅取消听写
+        elif event_type == Quartz.kCGEventKeyUp:
+            if keycode == KEY_Z and plain_cmd:
+                return None      # 配对吞掉 Cmd+Z 的抬起
+        return event
+
+    mask = (Quartz.CGEventMaskBit(Quartz.kCGEventKeyDown) |
+            Quartz.CGEventMaskBit(Quartz.kCGEventKeyUp))
+
+    def setup_tap():
+        tap = Quartz.CGEventTapCreate(
+            Quartz.kCGSessionEventTap, Quartz.kCGHeadInsertEventTap,
+            Quartz.kCGEventTapOptionDefault, mask, tap_cb, None)
+        if tap is None:
+            return False
+        tap_holder['tap'] = tap
+        src = Quartz.CFMachPortCreateRunLoopSource(None, tap, 0)
+        Quartz.CFRunLoopAddSource(Quartz.CFRunLoopGetCurrent(), src,
+                                  Quartz.kCFRunLoopCommonModes)
+        Quartz.CGEventTapEnable(tap, True)
+        return True
+
+    # ---- NSApplication + 状态栏图标（无 Dock 图标） ----
+    nsapp = NSApplication.sharedApplication()
+    nsapp.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+    item = NSStatusBar.systemStatusBar().statusItemWithLength_(
+        NSVariableStatusItemLength)
+    menu = NSMenu.alloc().init()
+    settings_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+        '打开隐私设置', 'openSettings:', '')
+    menu.addItem_(settings_item)
+    menu.addItem_(NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+        '退出', 'terminate:', ''))
+    item.setMenu_(menu)
+    app.status_item = item
+
+    # ---- 权限检查：缺失时弹系统授权框，服务降级运行而不是退出 ----
+    real_py = os.path.realpath(sys.executable)
+    ax_ok = None
+    if AXIsProcessTrustedWithOptions is not None:
+        ax_ok = AXIsProcessTrustedWithOptions(
+            {kAXTrustedCheckOptionPrompt: True})
+    listen_ok = Quartz.CGPreflightListenEventAccess()
+    if not listen_ok:
+        Quartz.CGRequestListenEventAccess()
+    if ax_ok is not True or not listen_ok:
+        log(f'权限缺失: accessibility={ax_ok} listen_event={listen_ok}; '
+            f'请给 {real_py} 授予 辅助功能+输入监控（+麦克风），'
+            '授权后若热键无反应需重启服务')
+
+    def mark_ready():
+        app.hotkey_ready = True
+        app._status('语音')
+        log('hotkey ready')
+
+    if setup_tap() and Quartz.CGPreflightListenEventAccess():
+        mark_ready()
+    else:
+        app._status('需授权')
+
+    # NSApp.run() 阻塞主线程时 Python 信号回调得不到执行机会，
+    # 用标志位 + 主线程定时器轮询来中转 SIGUSR1；同一定时器兼做
+    # 事件监听的重试（每 3s 一次，授权后即建，无需重启服务）
+    sigusr1_pending = [False]
+    signal.signal(signal.SIGUSR1, lambda *_: sigusr1_pending.__setitem__(0, True))
+    ticks = [0]
+
+    class Helper(NSObject):
+        def tick_(self, timer):
+            if sigusr1_pending[0]:
+                sigusr1_pending[0] = False
+                app.toggle()
+            ticks[0] += 1
+            if not app.hotkey_ready and ticks[0] % 15 == 0:
+                if 'tap' not in tap_holder:
+                    setup_tap()
+                if ('tap' in tap_holder
+                        and Quartz.CGPreflightListenEventAccess()):
+                    mark_ready()
+
+        def openSettings_(self, sender):
+            NSWorkspace.sharedWorkspace().openURL_(NSURL.URLWithString_(
+                'x-apple.systempreferences:'
+                'com.apple.preference.security?Privacy_ListenEvent'))
+
+    helper = Helper.alloc().init()
+    settings_item.setTarget_(helper)
+    NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+        0.2, helper, 'tick:', None, True)
+
+    # 排障用：SIGUSR2 把各线程栈打到日志（faulthandler 在信号上下文
+    # 直接输出，主线程被卡死时也能用）
+    import faulthandler
+    faulthandler.register(signal.SIGUSR2)
+
+    log('ready (Cmd+Z / SIGUSR1 toggle)')
+    AppHelper.runEventLoop()
+    return 0
+
+
+def run_service():
+    return run_service_macos() if IS_DARWIN else run_service_linux()
 
 
 if __name__ == '__main__':

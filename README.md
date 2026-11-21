@@ -52,9 +52,51 @@ curl -L -o "$MODELS/silero-vad/silero_vad.onnx" \
 
 幂等执行：创建 `venv`（`--system-site-packages`，需要系统 `gi`），安装 `sherpa-onnx`/`numpy`/`sounddevice`，写入并启用 `~/.config/systemd/user/voice-input.service`，并把 GNOME 自定义快捷键 `<Super>z` → `systemctl --user kill -s USR1 voice-input.service` 追加到 media-keys 列表（不会覆盖已有绑定）。
 
+## macOS
+
+macOS 下不依赖 IBus：服务用 Quartz 事件监听截获 **Cmd+Z**（会吞掉该键，焦点应用的撤销被覆盖，请知悉），识别文本通过合成键盘事件直接输入到当前焦点应用，菜单栏图标显示状态（`语音` / `听…` / `识别…`）。
+
+### 使用
+
+- Cmd+Z：开始 / 结束听写（覆盖系统撤销快捷键）
+- Esc：取消本次听写（仅在听写中生效）
+- SIGUSR1 同样可切换：`launchctl kill SIGUSR1 gui/$(id -u)/com.local.voice-input`
+
+### 模型
+
+macOS 默认模型位置（可用 `VOICE_INPUT_SENSEVOICE` / `VOICE_INPUT_VAD` 覆盖）：
+
+- SenseVoice 目录：`~/.cache/asr_models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17/`（含 `model.int8.onnx`、`tokens.txt`）
+- VAD 文件：`~/.cache/asr_models/silero_vad.onnx`，下载：
+
+```bash
+curl -L -o ~/.cache/asr_models/silero_vad.onnx \
+  https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.int8.onnx
+```
+
+### 安装
+
+```bash
+./install.sh
+```
+
+用 `uv` 创建 Python 3.12 venv（系统 Python 过新时 sherpa-onnx 无 wheel），安装 `sherpa-onnx`/`numpy`/`sounddevice`/`pyobjc`，下载 VAD（如缺失），写入并加载 `~/Library/LaunchAgents/com.local.voice-input.plist`。
+
+首次启动会自动弹出授权提示，需在「系统设置 > 隐私与安全性」给 install.sh 打印的 venv python **真实路径**（不是 Terminal）授予：**辅助功能**、**输入监控**、**麦克风**。授权前状态栏显示 `需授权`（菜单里有「打开隐私设置」入口），SIGUSR1 切换不受影响；授权后服务每 3 秒自动重试建立热键，若仍无反应执行 `launchctl kickstart -k gui/$(id -u)/com.local.voice-input` 重启服务（输入监控授权常需重启进程才生效）。
+
+### 日志与卸载
+
+```bash
+tail -f ~/Library/Logs/voice-input.log                 # 实时日志
+launchctl bootout gui/$(id -u)/com.local.voice-input   # 卸载
+rm ~/Library/LaunchAgents/com.local.voice-input.plist
+```
+
 ## 环境变量
 
-- `VOICE_INPUT_MODELS`：模型根目录（默认 `~/src/sub-live-v2/models`）
+- `VOICE_INPUT_MODELS`：模型根目录（Linux 默认 `~/src/sub-live-v2/models`）
+- `VOICE_INPUT_SENSEVOICE`：SenseVoice 模型目录（默认 `$VOICE_INPUT_MODELS/sensevoice`；macOS 默认 `~/.cache/asr_models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17`）
+- `VOICE_INPUT_VAD`：Silero VAD 模型文件（默认 `$VOICE_INPUT_MODELS/silero-vad/silero_vad.onnx`；macOS 默认 `~/.cache/asr_models/silero_vad.onnx`）
 - `VOICE_INPUT_LANG`：SenseVoice 语言（默认 `zh`，支持 `en`/`ja`/`ko`/`yue`/`auto`）
 - `VOICE_INPUT_DEBUG=1`：把识别文本写入日志（默认只记状态与耗时）
 - `VOICE_INPUT_TEST_WAV=文件.wav`：服务模式不占用麦克风，按实时节奏喂该 16k 单声道 wav（随后持续喂静音），用于无麦集成测试

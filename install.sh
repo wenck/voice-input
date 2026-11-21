@@ -1,7 +1,88 @@
 #!/usr/bin/env bash
-# voice-input 安装脚本（幂等）：venv + systemd user unit + GNOME 快捷键
+# voice-input 安装脚本（幂等）
+# Linux: venv + systemd user unit + GNOME 快捷键
+# macOS: uv venv + LaunchAgent
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
+
+if [ "$(uname)" = "Darwin" ]; then
+    if ! command -v uv >/dev/null; then
+        echo "error: 需要 uv，请先 brew install uv" >&2
+        exit 1
+    fi
+
+    SV=${VOICE_INPUT_SENSEVOICE:-~/.cache/asr_models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17}
+    VAD=${VOICE_INPUT_VAD:-~/.cache/asr_models/silero_vad.onnx}
+    if [ ! -f "$SV/model.int8.onnx" ]; then
+        cat >&2 <<EOF
+error: SenseVoice 模型缺失: $SV/model.int8.onnx
+下载并解压到 ~/.cache/asr_models/：
+  curl -L -o /tmp/sensevoice.tar.bz2 \\
+    https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2
+  tar -xjf /tmp/sensevoice.tar.bz2 -C ~/.cache/asr_models/
+EOF
+        exit 1
+    fi
+
+    # 1. venv：系统 python 版本过新可能无 sherpa-onnx wheel，固定 3.12
+    if [ ! -x venv/bin/python ]; then
+        uv venv --python 3.12 venv
+    fi
+    uv pip install --python venv/bin/python --quiet \
+        'sherpa-onnx==2.0.2' numpy sounddevice \
+        pyobjc-core pyobjc-framework-Quartz pyobjc-framework-Cocoa \
+        pyobjc-framework-ApplicationServices
+
+    # 2. Silero VAD（v4 int8，缺失才下载）
+    if [ ! -f "$VAD" ]; then
+        mkdir -p "$(dirname "$VAD")"
+        curl -L -o "$VAD" \
+            https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.int8.onnx
+    fi
+
+    # 3. LaunchAgent
+    PLIST=~/Library/LaunchAgents/com.local.voice-input.plist
+    mkdir -p ~/Library/LaunchAgents
+    cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.local.voice-input</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$PWD/voice-input</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    <key>StandardOutPath</key>
+    <string>$HOME/Library/Logs/voice-input.log</string>
+    <key>StandardErrorPath</key>
+    <string>$HOME/Library/Logs/voice-input.log</string>
+</dict>
+</plist>
+EOF
+    launchctl bootout "gui/$(id -u)/com.local.voice-input" 2>/dev/null || true
+    launchctl bootstrap "gui/$(id -u)" "$PLIST"
+
+    PYBIN=$(readlink -f venv/bin/python)
+    cat <<EOF
+installed. Cmd+Z 开始/结束听写，Esc 取消。
+注意：需给 venv python 真实二进制授权（系统设置 > 隐私与安全性）：
+  辅助功能 + 输入监控 + 麦克风: $PYBIN
+日志: tail -f ~/Library/Logs/voice-input.log
+EOF
+    exit 0
+fi
+
+# ---- Linux ----
 
 # 1. venv：必须 --system-site-packages 才有 gi / IBus typelib
 if [ ! -x venv/bin/python ]; then
