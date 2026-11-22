@@ -810,6 +810,7 @@ def run_service_macos():
     def tap_cb(proxy, event_type, event, refcon):
         if event_type in (Quartz.kCGEventTapDisabledByTimeout,
                           Quartz.kCGEventTapDisabledByUserInput):
+            log(f'event tap disabled (type={event_type}), re-enabling')
             tap = tap_holder.get('tap')
             if tap is not None:
                 Quartz.CGEventTapEnable(tap, True)
@@ -824,6 +825,8 @@ def run_service_macos():
                 if Quartz.CGEventGetIntegerValueField(
                         event, Quartz.kCGKeyboardEventAutorepeat):
                     return None  # 吞掉自动重复
+                if DEBUG:
+                    log('[debug] Cmd+Z')
                 AppHelper.callAfter(app.toggle)
                 return None      # 吞掉，避免焦点应用触发撤销
             if keycode == KEY_ESC and app.state == 'listening':
